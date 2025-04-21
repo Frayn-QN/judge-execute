@@ -1,0 +1,9 @@
+version: '3'
+services:
+  judge-execute:
+    network_mode: "host"
+    build:
+      context: ..
+      dockerfile: docker/DockerFile
+    container_name: judge-execute
+    working_dir: /app

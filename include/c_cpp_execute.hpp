@@ -2,10 +2,12 @@
 
 #include <workspace/workspace.hpp>
 #include <sys/wait.h>
+#include <sys/stat.h>
 
 #include "execute_interface.h"
 
-class C_CppExecute : public ExecuteInterface {
+class C_CppExecute : public ExecuteInterface
+{
 private:
     wsp::workspace *spc_ptr;
     json &taskData;
@@ -14,81 +16,109 @@ private:
     fs::path taskDir;
 
 public:
-    C_CppExecute(wsp::workspace* spc, json& taskData):
-        spc_ptr(spc),
-        taskData(taskData),
-        task(taskData["task"])
+    C_CppExecute(wsp::workspace *spc, json &taskData) : spc_ptr(spc),
+                                                        taskData(taskData),
+                                                        task(taskData["task"])
     {
         taskID = task["id"];
         taskDir = FILE_ROOT_PATH + taskID;
 
-        if(!fs::exists(taskDir)) {// 创建任务目录
-            if(!fs::create_directories(taskDir))
-                throw new runtime_error("Cannot create directory");
-        }
-    }
-
-    ~C_CppExecute() {
-        // 移除任务目录
-        fs::remove_all(taskDir);
-    }
-
-    void save() override {
-        json execute = taskData["execute"];
-        json in = taskData["example"];
-        json expectation = taskData["expectation"];
-
-        // 创建任务目录
-        if(!fs::exists(taskDir)) {
-            if(!fs::create_directories(taskDir))
+        if (!fs::exists(taskDir))
+        { // 创建任务目录
+            if (!fs::create_directories(taskDir))
                 throw std::runtime_error("Cannot create directory");
         }
         else // 由于id的唯一性，理论上不触发
             throw std::runtime_error("Directory already exists");
+    }
+
+    ~C_CppExecute() override
+    {
+        // 移除任务目录
+        fs::remove_all(taskDir);
+    }
+
+    void save() override
+    {
+        json execute = taskData["execute"];
+        json in = taskData["example"];
+        json expectation = taskData["expectation"];
 
         // 保存执行文件
         saveFromJsonList(execute, taskDir);
 
         // 保存样例输入
         fs::path dir_input(taskDir / "input");
-        if(!fs::create_directories(dir_input))
+        if (!fs::create_directories(dir_input))
             throw std::runtime_error("Cannot create directory");
         saveFromJsonList(in, dir_input);
 
         // 保存期望输出
         fs::path dir_expectation(taskDir / "expectation");
-        if(!fs::create_directories(dir_expectation))
+        if (!fs::create_directories(dir_expectation))
             throw std::runtime_error("Cannot create directory");
         saveFromJsonList(expectation, dir_expectation);
 
         // 创建输出目录
         fs::path dir_output(taskDir / "output");
-        if(!fs::create_directories(dir_output))
+        if (!fs::create_directories(dir_output))
             throw std::runtime_error("Cannot create directory");
+
+        // 为 main 文件添加执行权限
+        fs::path mainPath = taskDir / "main";
+        if (!fs::exists(mainPath))
+        {
+            throw std::runtime_error("main 可执行文件未生成");
+        }
+        if (chmod(mainPath.c_str(), 0755) != 0)
+        { // 设置权限为 rwxr-xr-x
+            throw std::runtime_error("权限设置失败: " + std::string(strerror(errno)));
+        }
     }
 
-    void execute() override {
-        int timeLimit = taskData["timeLimit"];      // ms
-        int memoryLimit = taskData["memoryLimit"];  // MB
+    void execute() override
+    {
+        std::cout << "execute 0" << endl;
+        int timeLimit = taskData["timeLimit"];     // ms
+        int memoryLimit = taskData["memoryLimit"]; // MB
         int testCount = taskData["testCount"];
 
+        // cgroup name
+        std::string memGroup = taskID;
+        // 创建cgroup
+        if (system(("cgcreate -g memory:" + memGroup).c_str()) != 0)
+        {
+            throw std::runtime_error("Failed to create cgroup: " + memGroup);
+        }
+        // 设置内存限制, (1MB = 1048576Bytes,此处可直接加M)
+        std::string cmd = "cgset -r memory.max=" + std::to_string(memoryLimit) + "M " + memGroup;
+        if (system(cmd.c_str()) != 0)
+        {
+            throw std::runtime_error("Failed to set cgroup memory limit: " + memGroup);
+        }
+
         // 多次执行
-        for(int i = 1; i <= testCount; i++) {
+        for (int i = 1; i <= testCount; i++)
+        {
+
+            std::cout << "execute " << i << endl;
+
             // 执行参数（运行二进制程序）
-            std::vector<const char*> args;
-            args.push_back("./main");// 标准程序名
+            std::vector<const char *> args;
+            args.push_back("./main"); // 标准程序名
             args.push_back(nullptr);
 
             // 输入文件
             fs::path inputFile(taskDir / "input" / (std::to_string(i) + ".in"));
             // 输出文件，同上
             fs::path outputFile(taskDir / "output" / (std::to_string(i) + ".out"));
-            // cgroup用参数
-            std::string memGroup = "/" + taskID + "_" + std::to_string(i);
 
             // 创建管道用于从stderr获取运行失败信息
             int pipefd[2];
-            if(pipe(pipefd) == -1) {
+            if (pipe(pipefd) == -1)
+            {
+                // 清理Cgroup
+                system(("cgdelete memory:" + memGroup).c_str());
                 throw std::runtime_error("Pipe failed");
             }
 
@@ -97,16 +127,20 @@ public:
 
             // fork
             pid_t pid = fork();
-            if(pid == -1) {
+            if (pid == -1)
+            {
                 close(pipefd[0]);
                 close(pipefd[1]);
+                // 清理Cgroup
+                system(("cgdelete memory:" + memGroup).c_str());
                 throw std::runtime_error("Fork failed");
             }
-            else if(pid == 0) {// 子进程
+            else if (pid == 0)
+            { // 子进程
                 chdir(taskDir.c_str());
 
                 // 重定向
-                close(pipefd[0]);// 关闭读端
+                close(pipefd[0]); // 关闭读端
                 dup2(pipefd[1], STDERR_FILENO);
                 close(pipefd[1]);
                 freopen(inputFile.c_str(), "r", stdin);
@@ -116,43 +150,48 @@ public:
                 unshare(CLONE_NEWPID | CLONE_NEWNS);
 
                 // 执行
-                execvp("./main", const_cast<char* const*>(args.data()));
+                execvp("./main", const_cast<char *const *>(args.data()));
 
                 // execvp 失败
-                std::cerr << "执行命令失败" << std::endl;
+                std::cerr << "执行命令失败";
                 _exit(1);
             }
-            else if(pid > 0) {// 父进程
-                close(pipefd[1]);// 关闭写端
+            else if (pid > 0) // 父进程
+            {
+                cout << getpid() << "--" << pid << endl;
+                close(pipefd[1]); // 关闭写端
                 child_pid.store(pid);
 
-                // 设置内存限制, 1MB = 1048576Bytes
-                system(("cgcreate -g memory:" + memGroup).c_str());  // 创建Cgroup
-                std::string cmd = "cgset -r memory.limit_in_bytes=" 
-                        + std::to_string(memoryLimit * 1048576) + "M " + memGroup;
-                system(cmd.c_str());
-                std::ofstream("/sys/fs/cgroup/memory" + memGroup + "/cgroup.procs") << pid;
+                // 将子进程 PID 加入 cgroup
+                if (system(("cgclassify -g memory:" + memGroup + " " + std::to_string(pid)).c_str()) != 0)
+                {
+                    system(("cgdelete memory:" + memGroup).c_str());
+                    throw std::runtime_error(memGroup + " failed to add pid: " + std::to_string(pid));
+                }
 
                 // 设置定时任务
-                spc_ptr->submit([this, timeLimit, &child_pid] {
-                    executeAlarm(timeLimit, child_pid);
-                });
+                spc_ptr->submit([this, timeLimit, &child_pid]
+                                { executeAlarm(timeLimit, child_pid); });
 
                 int status;
-                if(waitpid(pid, &status, 0) > 0) {// 等待子进程执行结束
+                if (waitpid(pid, &status, 0) > 0)
+                { // 等待子进程执行结束
                     child_pid.store(-1);
                 }
-                // 清理Cgroup
-                system(("cgdelete memory:" + memGroup).c_str());
 
-                if(WIFSIGNALED(status)) {// 信号中止
-                    close(pipefd[0]);// 退出前关闭读端
+                if (WIFSIGNALED(status))
+                {                                                    // 信号中止
+                    close(pipefd[0]);                                // 退出前关闭读端
+                    system(("cgdelete memory:" + memGroup).c_str()); // 清理Cgroup
+
                     int sig = WTERMSIG(status);
-                    if(sig == SIGTERM) {// 超时
-                        throw new time_limit_error("time out!");
+                    if (sig == SIGTERM)
+                    { // 超时
+                        throw time_limit_error("time out!");
                     }
-                    else if(sig == SIGKILL) {// 超内存
-                        throw new memory_limit_error("memory out of limit!");
+                    else if (sig == SIGKILL)
+                    { // 超内存
+                        throw memory_limit_error("memory out of limit!");
                     }
                     // 未知错误
                     throw "unknown signal interrupt";
@@ -161,34 +200,52 @@ public:
                 // 读取错误信息
                 char buffer[1024];
                 std::string executeError;
-                while(read(pipefd[0], buffer, sizeof(buffer)) > 0) {
+                ssize_t bytesRead;
+                while ((bytesRead = read(pipefd[0], buffer, sizeof(buffer) - 1)) > 0)
+                {
+                    buffer[bytesRead] = '\0';
                     executeError += buffer;
                 }
                 close(pipefd[0]);
-                throw runtime_error(executeError);
+
+                if (!executeError.empty())
+                {
+                    // 清理Cgroup
+                    system(("cgdelete memory:" + memGroup).c_str());
+                    throw runtime_error(executeError);
+                }
             }
         }
+        // 清理Cgroup
+        system(("cgdelete memory:" + memGroup).c_str());
     }
-    
-    void compare() override {
+
+    void compare() override
+    {
         int testCount = taskData["testCount"];
         int acceptCount = 0, wrongCount = 0;
-        for(int i = 1; i <= testCount; i++) {
-            fs::path outputPath(taskDir / "output" / (std::to_string(i)+".out"));
-            fs::path expectationPath(taskDir / "expectation" / (std::to_string(i)+".out"));
-            
-            if(compareFilesByLine(outputPath, expectationPath)) acceptCount++;
-            else wrongCount++;
+        for (int i = 1; i <= testCount; i++)
+        {
+            fs::path outputPath(taskDir / "output" / (std::to_string(i) + ".out"));
+            fs::path expectationPath(taskDir / "expectation" / (std::to_string(i) + ".out"));
+
+            if (compareFilesByLine(outputPath, expectationPath))
+                acceptCount++;
+            else
+                wrongCount++;
         }
 
         json *result = &task["result"];
         (*result)["total"] = testCount;
         (*result)["accept"] = acceptCount;
         (*result)["wrong"] = wrongCount;
-        task["score"] = 1.0*acceptCount / testCount;
+        task["score"] = 100.0 * acceptCount / testCount;
 
-        if(wrongCount == 0)
+        if (wrongCount == 0)
             task["status"] = "AC";
-        else task["status"] = "WA";
+        else
+            task["status"] = "WA";
+
+        std::cout << "compare" << endl;
     }
 };

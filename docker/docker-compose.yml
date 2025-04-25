@@ -7,3 +7,10 @@ services:
       dockerfile: docker/DockerFile
     container_name: judge-execute
     working_dir: /app
+    cap_add:
+      - SYS_ADMIN
+      - SYS_RESOURCE
+    volumes:
+      - /sys/fs/cgroup:/sys/fs/cgroup:rw
+    tmpfs:
+      - /sys/fs/cgroup/memory

@@ -10,6 +10,8 @@
 class ExecuteInterface
 {
 public:
+    virtual ~ExecuteInterface() = default;
+
     /**
      * @brief 保存到文件系统
      */
@@ -54,8 +56,15 @@ public:
         if (!list.is_array())
             throw std::runtime_error("wrong json type: not array");
 
-        for (auto &item : list.items())
+        for (auto &element : list)
         {
+            if (!element.is_object())
+                throw std::runtime_error("array element is not an object");
+
+            auto item = element.begin();
+            if (item == element.end())
+                throw std::runtime_error("array element has no key-value pair");
+
             std::string key = item.key();
             std::string value = item.value();
 

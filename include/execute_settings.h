@@ -54,3 +54,16 @@ public:
         return msg.c_str();
     }
 };
+
+// 生成当前时间的格式化字符串
+std::string getCurrentTime()
+{
+    auto now = std::chrono::system_clock::now();
+    time_t now_time = std::chrono::system_clock::to_time_t(now);
+    tm tm_struct;
+    localtime_r(&now_time, &tm_struct); // 使用线程安全的localtime_r
+
+    std::stringstream ss;
+    ss << "[" << std::put_time(&tm_struct, "%Y-%m-%d %H:%M:%S") << "]:";
+    return ss.str();
+}

@@ -3,6 +3,9 @@
 #include <chrono>
 #include <csignal>
 #include <atomic>
+#include <sys/resource.h>
+#include <unistd.h>
+#include <sys/wait.h>
 
 #include "execute_settings.h"
 #include "file_methods.hpp"
@@ -44,6 +47,40 @@ public:
         {
             kill(pid.load(), SIGTERM);
         }
+    }
+
+    /**
+     * 设置内存限制
+     * @param mem_limit 单位Byte
+     */
+    void setProcLimit(rlim_t mem_limit)
+    {
+        struct rlimit rl;
+        rl.rlim_cur = mem_limit; // 软限制
+        rl.rlim_max = mem_limit; // 硬限制（普通用户不可逆降低）
+        if (setrlimit(RLIMIT_AS, &rl) == -1)
+        { // RLIMIT_AS 限制虚拟内存
+            perror("setrlimit failed");
+            exit(EXIT_FAILURE);
+        }
+    }
+
+    /**
+     * 获取虚拟内存峰值
+     */
+    size_t get_vm_peak(pid_t pid)
+    {
+        std::ifstream status("/proc/" + std::to_string(pid) + "/status");
+        std::string line;
+        while (std::getline(status, line))
+        {
+            if (line.rfind("VmPeak", 0) == 0)
+            {
+                size_t kb = std::stoul(line.substr(7));
+                return kb / 1024; // 转换为MB
+            }
+        }
+        return 0;
     }
 
     /**

@@ -77,8 +77,6 @@ public:
             fs::path inputFile(taskDir / "input" / (std::to_string(i) + ".in"));
             // 输出文件，同上
             fs::path outputFile(taskDir / "output" / (std::to_string(i) + ".out"));
-            // cgroup用参数
-            std::string memGroup = "/" + taskID + "_" + std::to_string(i);
 
             // 执行参数（运行二进制程序）
             std::vector<const char *> args;
@@ -130,27 +128,6 @@ public:
                 close(pipefd[1]); // 关闭写端
                 child_pid.store(pid);
 
-                // 创建Cgroup
-                if (system(("cgcreate -g memory:" + memGroup).c_str()) != 0)
-                {
-                    throw std::runtime_error("Failed to create cgroup: " + memGroup);
-                }
-
-                // 设置内存限制, 1MB = 1048576Bytes
-                std::string cmd = "cgset -r memory.limit_in_bytes=" + std::to_string(memoryLimit * 1048576) + "M " + memGroup;
-                if (system(cmd.c_str()) != 0)
-                {
-                    throw std::runtime_error("Failed to set cgroup memory limit: " + memGroup);
-                }
-
-                // 将子进程 PID 加入 cgroup
-                std::ofstream cgroupProcsFile("/sys/fs/cgroup/memory/" + memGroup + "/cgroup.procs");
-                if (!cgroupProcsFile)
-                {
-                    throw std::runtime_error("Failed to open cgroup.procs");
-                }
-                cgroupProcsFile << pid;
-
                 // 设置定时任务
                 spc_ptr->submit([this, timeLimit, &child_pid]
                                 { executeAlarm(timeLimit, child_pid); });
@@ -160,34 +137,46 @@ public:
                 { // 等待子进程执行结束
                     child_pid.store(-1);
                 }
-                // 清理Cgroup
-                system(("cgdelete memory:" + memGroup).c_str());
-
-                if (WIFSIGNALED(status))
-                {                     // 信号中止
-                    close(pipefd[0]); // 退出前关闭读端
-                    int sig = WTERMSIG(status);
-                    if (sig == SIGTERM)
-                    { // 超时
-                        throw new time_limit_error("time out!");
-                    }
-                    else if (sig == SIGKILL)
-                    { // 超内存
-                        throw new memory_limit_error("memory out of limit!");
-                    }
-                    // 未知错误
-                    throw "unknown signal interrupt";
-                }
 
                 // 读取错误信息
                 char buffer[1024];
                 std::string executeError;
-                while (read(pipefd[0], buffer, sizeof(buffer)) > 0)
+                ssize_t bytesRead;
+                while ((bytesRead = read(pipefd[0], buffer, sizeof(buffer) - 1)) > 0)
                 {
+                    buffer[bytesRead] = '\0';
                     executeError += buffer;
                 }
                 close(pipefd[0]);
-                throw runtime_error(executeError);
+
+                if (WIFSIGNALED(status))
+                {                     // 信号中止
+                    close(pipefd[0]); // 退出前关闭读端
+
+                    int sig = WTERMSIG(status);
+                    if (sig == SIGTERM)
+                    { // 超时
+                        throw time_limit_error("time out!");
+                    }
+                    else if (sig == SIGSEGV)
+                    {
+                        if (get_vm_peak(pid) >= memoryLimit) // 超内存
+                            throw memory_limit_error("memory out of limit!");
+                        else
+                            throw runtime_error(executeError);
+                    }
+                    else if (sig == SIGKILL)
+                    { // oom结束进程
+                        throw memory_limit_error("kill by oom!");
+                    }
+                    // 未知错误
+                    throw runtime_error("signal:" + std::to_string(sig));
+                }
+
+                if (!executeError.empty())
+                {
+                    throw runtime_error(executeError);
+                }
             }
         }
     }

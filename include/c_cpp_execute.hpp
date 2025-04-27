@@ -78,31 +78,13 @@ public:
 
     void execute() override
     {
-        std::cout << "execute 0" << endl;
         int timeLimit = taskData["timeLimit"];     // ms
         int memoryLimit = taskData["memoryLimit"]; // MB
         int testCount = taskData["testCount"];
 
-        // cgroup name
-        std::string memGroup = taskID;
-        // 创建cgroup
-        if (system(("cgcreate -g memory:" + memGroup).c_str()) != 0)
-        {
-            throw std::runtime_error("Failed to create cgroup: " + memGroup);
-        }
-        // 设置内存限制, (1MB = 1048576Bytes,此处可直接加M)
-        std::string cmd = "cgset -r memory.max=" + std::to_string(memoryLimit) + "M " + memGroup;
-        if (system(cmd.c_str()) != 0)
-        {
-            throw std::runtime_error("Failed to set cgroup memory limit: " + memGroup);
-        }
-
         // 多次执行
         for (int i = 1; i <= testCount; i++)
         {
-
-            std::cout << "execute " << i << endl;
-
             // 执行参数（运行二进制程序）
             std::vector<const char *> args;
             args.push_back("./main"); // 标准程序名
@@ -117,8 +99,6 @@ public:
             int pipefd[2];
             if (pipe(pipefd) == -1)
             {
-                // 清理Cgroup
-                system(("cgdelete memory:" + memGroup).c_str());
                 throw std::runtime_error("Pipe failed");
             }
 
@@ -131,12 +111,13 @@ public:
             {
                 close(pipefd[0]);
                 close(pipefd[1]);
-                // 清理Cgroup
-                system(("cgdelete memory:" + memGroup).c_str());
                 throw std::runtime_error("Fork failed");
             }
             else if (pid == 0)
             { // 子进程
+                // 内存限制, 1MB = 1048576Bytes
+                setProcLimit(memoryLimit * 1048576);
+
                 chdir(taskDir.c_str());
 
                 // 重定向
@@ -158,16 +139,8 @@ public:
             }
             else if (pid > 0) // 父进程
             {
-                cout << getpid() << "--" << pid << endl;
                 close(pipefd[1]); // 关闭写端
                 child_pid.store(pid);
-
-                // 将子进程 PID 加入 cgroup
-                if (system(("cgclassify -g memory:" + memGroup + " " + std::to_string(pid)).c_str()) != 0)
-                {
-                    system(("cgdelete memory:" + memGroup).c_str());
-                    throw std::runtime_error(memGroup + " failed to add pid: " + std::to_string(pid));
-                }
 
                 // 设置定时任务
                 spc_ptr->submit([this, timeLimit, &child_pid]
@@ -177,24 +150,6 @@ public:
                 if (waitpid(pid, &status, 0) > 0)
                 { // 等待子进程执行结束
                     child_pid.store(-1);
-                }
-
-                if (WIFSIGNALED(status))
-                {                                                    // 信号中止
-                    close(pipefd[0]);                                // 退出前关闭读端
-                    system(("cgdelete memory:" + memGroup).c_str()); // 清理Cgroup
-
-                    int sig = WTERMSIG(status);
-                    if (sig == SIGTERM)
-                    { // 超时
-                        throw time_limit_error("time out!");
-                    }
-                    else if (sig == SIGKILL)
-                    { // 超内存
-                        throw memory_limit_error("memory out of limit!");
-                    }
-                    // 未知错误
-                    throw "unknown signal interrupt";
                 }
 
                 // 读取错误信息
@@ -208,16 +163,36 @@ public:
                 }
                 close(pipefd[0]);
 
+                if (WIFSIGNALED(status))
+                {                     // 信号中止
+                    close(pipefd[0]); // 退出前关闭读端
+
+                    int sig = WTERMSIG(status);
+                    if (sig == SIGTERM)
+                    { // 超时
+                        throw time_limit_error("time out!");
+                    }
+                    else if (sig == SIGSEGV)
+                    {
+                        if (get_vm_peak(pid) >= memoryLimit) // 超内存
+                            throw memory_limit_error("memory out of limit!");
+                        else
+                            throw runtime_error(executeError);
+                    }
+                    else if (sig == SIGKILL)
+                    { // oom结束进程
+                        throw memory_limit_error("kill by oom!");
+                    }
+                    // 未知错误
+                    throw runtime_error("signal:" + std::to_string(sig));
+                }
+
                 if (!executeError.empty())
                 {
-                    // 清理Cgroup
-                    system(("cgdelete memory:" + memGroup).c_str());
                     throw runtime_error(executeError);
                 }
             }
         }
-        // 清理Cgroup
-        system(("cgdelete memory:" + memGroup).c_str());
     }
 
     void compare() override
@@ -245,7 +220,5 @@ public:
             task["status"] = "AC";
         else
             task["status"] = "WA";
-
-        std::cout << "compare" << endl;
     }
 };
